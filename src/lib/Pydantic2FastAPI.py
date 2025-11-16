@@ -2536,7 +2536,7 @@ def register_route(
         )
         async def search_resources(
             request: Dict = Depends(get_request_info),
-            criteria: network_model.SEARCH = Body(...),
+            criteria: Dict[str, Any] = Body(...),
             manager=Depends(manager_factory),
             include: Optional[Union[List[str], str]] = Query(None),
             fields: Optional[Union[List[str], str]] = Query(None),
@@ -2567,49 +2567,78 @@ def register_route(
                 #     **search_data,
                 # )
 
-                actual_include = (
-                    include
-                    if include is not None
-                    else getattr(criteria, "include", None)
-                )
-                actual_fields = (
-                    fields if fields is not None else getattr(criteria, "fields", None)
-                )
+                # If criteria is a Pydantic model the attributes are accessed via
+                # getattr; if it's a plain dict, read keys. Prefer explicit
+                # query params over body values.
+                def _body_val(obj, key, alt_keys=None):
+                    if isinstance(obj, dict):
+                        if key in obj:
+                            return obj.get(key)
+                        if alt_keys:
+                            for k in alt_keys:
+                                if k in obj:
+                                    return obj.get(k)
+                        return None
+                    return getattr(obj, key, None)
+
+                # Pull body-level projection/pagination/sort values (and remove them
+                # from search_data so they aren't forwarded twice)
+                body_include = None
+                body_fields = None
+                body_limit = None
+                body_offset = None
+                body_page = None
+                body_page_size = None
+                body_sort_by = None
+                body_sort_order = None
+                if isinstance(search_data, dict):
+                    # Merge nested 'search' key if present (backwards compat)
+                    if "search" in search_data and isinstance(search_data["search"], dict):
+                        nested = search_data.pop("search")
+                        for k, v in nested.items():
+                            search_data.setdefault(k, v)
+
+                    # Extract and pop known control keys
+                    for k in ["include", "fields", "limit", "offset", "page", "pageSize", "page_size", "sort_by", "sortBy", "sort_order", "sortOrder"]:
+                        if k in search_data:
+                            v = search_data.pop(k)
+                            if k == "include":
+                                body_include = v
+                            elif k == "fields":
+                                body_fields = v
+                            elif k == "limit":
+                                body_limit = v
+                            elif k == "offset":
+                                body_offset = v
+                            elif k == "page":
+                                body_page = v
+                            elif k in ("pageSize", "page_size"):
+                                body_page_size = v
+                            elif k in ("sort_by", "sortBy"):
+                                body_sort_by = v
+                            elif k in ("sort_order", "sortOrder"):
+                                body_sort_order = v
+
+                actual_include = include if include is not None else _body_val(criteria, "include") or body_include
+                actual_fields = fields if fields is not None else _body_val(criteria, "fields") or body_fields
 
                 # Normalize include/fields to lists if strings provided
                 actual_include = _normalize_query_list(actual_include)
                 actual_fields = _normalize_query_list(actual_fields)
-                actual_limit = (
-                    limit if limit is not None else getattr(criteria, "limit", None)
-                )
+
+                actual_limit = limit if limit is not None else (_body_val(criteria, "limit") or body_limit)
                 if actual_limit is None:
                     actual_limit = 100
 
-                actual_offset = (
-                    offset if offset is not None else getattr(criteria, "offset", None)
-                )
+                actual_offset = offset if offset is not None else (_body_val(criteria, "offset") or body_offset)
                 if actual_offset is None:
                     actual_offset = 0
 
-                actual_page = (
-                    page if page is not None else getattr(criteria, "page", None)
-                )
-                actual_page_size = (
-                    page_size
-                    if page_size is not None
-                    else getattr(criteria, "pageSize", None)
-                )
+                actual_page = page if page is not None else (_body_val(criteria, "page") or body_page)
+                actual_page_size = page_size if page_size is not None else (_body_val(criteria, "pageSize") or body_page_size)
 
-                actual_sort_by = (
-                    sort_by
-                    if sort_by is not None
-                    else getattr(criteria, "sort_by", None)
-                )
-                actual_sort_order = (
-                    sort_order
-                    if sort_order is not None
-                    else getattr(criteria, "sort_order", None)
-                )
+                actual_sort_by = sort_by if sort_by is not None else (_body_val(criteria, "sort_by") or _body_val(criteria, "sortBy") or body_sort_by)
+                actual_sort_order = sort_order if sort_order is not None else (_body_val(criteria, "sort_order") or _body_val(criteria, "sortOrder") or body_sort_order)
                 if not actual_sort_order:
                     actual_sort_order = "asc"
 
@@ -2622,22 +2651,42 @@ def register_route(
                     sort_order=actual_sort_order,
                     page=actual_page,
                     pageSize=actual_page_size,
-                    **search_data,
+                    **(search_data or {}),
                 )
 
                 # Serialize search results before building response model
                 serialized_search_results = serialize_for_response(search_results)
-                response_model_instance = network_model.ResponsePlural(
-                    **{resource_name_plural: serialized_search_results}
+
+                # Determine response key: if the original request body was
+                # resource-wrapped (e.g. {"role": {...}}) return the
+                # resource-specific plural key; otherwise return generic
+                # "entities" to support tests that POST top-level search bodies.
+                response_key = (
+                    resource_name_plural
+                    if isinstance(criteria, dict)
+                    and (resource_name in criteria or resource_name_plural in criteria)
+                    else "entities"
                 )
+
+                # Build a ResponsePlural when returning resource-specific key
+                response_model_instance = None
+                if response_key == resource_name_plural:
+                    response_model_instance = network_model.ResponsePlural(
+                        **{resource_name_plural: serialized_search_results}
+                    )
 
                 fields_selection = _normalize_projection_values(actual_fields)
                 include_selection = _normalize_projection_values(actual_include)
 
-                if fields_selection:
+                # Prepare serialized items depending on response model
+                if response_model_instance is not None:
                     serialized_items = serialize_for_response(
                         getattr(response_model_instance, resource_name_plural)
                     )
+                else:
+                    serialized_items = serialized_search_results or []
+
+                if fields_selection:
                     projected_items = [
                         _apply_field_projection_to_entity(
                             item, fields_selection, include_selection
@@ -2645,9 +2694,7 @@ def register_route(
                         for item in serialized_items or []
                     ]
                     return JSONResponse(
-                        content=jsonable_encoder(
-                            {resource_name_plural: projected_items}
-                        ),
+                        content=jsonable_encoder({response_key: projected_items}),
                         status_code=status.HTTP_200_OK,
                     )
 
@@ -2656,13 +2703,17 @@ def register_route(
                         serialized_search_results, include_selection, model_registry
                     )
                     return JSONResponse(
-                        content=jsonable_encoder(
-                            {resource_name_plural: populated_items}
-                        ),
+                        content=jsonable_encoder({response_key: populated_items}),
                         status_code=status.HTTP_200_OK,
                     )
 
-                return response_model_instance
+                # Default return: Response model when possible, otherwise generic dict
+                if response_model_instance is not None:
+                    return response_model_instance
+                return JSONResponse(
+                    content=jsonable_encoder({response_key: serialized_search_results}),
+                    status_code=status.HTTP_200_OK,
+                )
             except Exception as err:
                 handle_resource_operation_error(err)
 
