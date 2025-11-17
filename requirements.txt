@@ -52,5 +52,5 @@ resolvelib
 semver
 stringcase
 black
-setuptools
+setuptools<58
 tldextract
